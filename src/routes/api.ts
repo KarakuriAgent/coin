@@ -1,23 +1,10 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { eq, sql, desc } from "drizzle-orm";
-import { db, sqlite, persistDb } from "../db/index.js";
+import { db, withTransaction } from "../db/index.js";
 import { accounts, transactions } from "../db/schema.js";
 
 const api = new Hono();
-
-function withTransaction<T>(fn: () => T): T {
-  sqlite.run("BEGIN");
-  try {
-    const result = fn();
-    sqlite.run("COMMIT");
-    persistDb();
-    return result;
-  } catch (e) {
-    sqlite.run("ROLLBACK");
-    throw e;
-  }
-}
 
 // Health check
 api.get("/health", (c) => {
@@ -50,24 +37,26 @@ api.post("/accounts", async (c) => {
 
   if (existing) {
     if (username && username !== existing.username) {
-      db.update(accounts)
-        .set({ username, updatedAt: sql`datetime('now')` })
-        .where(eq(accounts.id, existing.id))
-        .run();
-      persistDb();
+      withTransaction(() => {
+        db.update(accounts)
+          .set({ username, updatedAt: sql`datetime('now')` })
+          .where(eq(accounts.id, existing.id))
+          .run();
+      });
       existing.username = username;
     }
     return c.json(existing);
   }
 
   const id = crypto.randomUUID();
-  const account = db
-    .insert(accounts)
-    .values({ id, discordId: discord_id, username: username || null })
-    .returning()
-    .get();
+  const account = withTransaction(() =>
+    db
+      .insert(accounts)
+      .values({ id, discordId: discord_id, username: username || null })
+      .returning()
+      .get()
+  );
 
-  persistDb();
   return c.json(account, 201);
 });
 
@@ -106,8 +95,10 @@ api.get("/accounts/:discord_id", async (c) => {
 });
 
 // Credit
+const MAX_AMOUNT = 1_000_000_000;
+
 const amountSchema = z.object({
-  amount: z.number().int().positive(),
+  amount: z.number().int().positive().max(MAX_AMOUNT),
   reason: z.string().optional(),
 });
 
@@ -124,26 +115,30 @@ api.post("/accounts/:discord_id/credit", async (c) => {
 
   const { amount, reason } = parsed.data;
 
+  const account = db
+    .select()
+    .from(accounts)
+    .where(eq(accounts.discordId, discord_id))
+    .get();
+
+  if (!account) {
+    return c.json(
+      { error: { code: "ACCOUNT_NOT_FOUND", message: "Account not found" } },
+      404
+    );
+  }
+
   const result = withTransaction(() => {
-    const account = db
-      .select()
-      .from(accounts)
-      .where(eq(accounts.discordId, discord_id))
-      .get();
-
-    if (!account) return null;
-
     const newBalance = account.balance + amount;
     db.update(accounts)
       .set({ balance: newBalance, updatedAt: sql`datetime('now')` })
       .where(eq(accounts.id, account.id))
       .run();
 
-    const txId = crypto.randomUUID();
     const tx = db
       .insert(transactions)
       .values({
-        id: txId,
+        id: crypto.randomUUID(),
         accountId: account.id,
         type: "credit",
         amount,
@@ -155,13 +150,6 @@ api.post("/accounts/:discord_id/credit", async (c) => {
 
     return { balance: newBalance, transaction: tx };
   });
-
-  if (!result) {
-    return c.json(
-      { error: { code: "ACCOUNT_NOT_FOUND", message: "Account not found" } },
-      404
-    );
-  }
 
   return c.json(result);
 });
@@ -180,34 +168,42 @@ api.post("/accounts/:discord_id/debit", async (c) => {
 
   const { amount, reason } = parsed.data;
 
+  const account = db
+    .select()
+    .from(accounts)
+    .where(eq(accounts.discordId, discord_id))
+    .get();
+
+  if (!account) {
+    return c.json(
+      { error: { code: "ACCOUNT_NOT_FOUND", message: "Account not found" } },
+      404
+    );
+  }
+
+  if (account.balance < amount) {
+    return c.json(
+      {
+        error: {
+          code: "INSUFFICIENT_BALANCE",
+          message: `Insufficient balance (current: ${account.balance}, required: ${amount})`,
+        },
+      },
+      400
+    );
+  }
+
   const result = withTransaction(() => {
-    const account = db
-      .select()
-      .from(accounts)
-      .where(eq(accounts.discordId, discord_id))
-      .get();
-
-    if (!account) return { error: "not_found" as const };
-
-    if (account.balance < amount) {
-      return {
-        error: "insufficient" as const,
-        balance: account.balance,
-        required: amount,
-      };
-    }
-
     const newBalance = account.balance - amount;
     db.update(accounts)
       .set({ balance: newBalance, updatedAt: sql`datetime('now')` })
       .where(eq(accounts.id, account.id))
       .run();
 
-    const txId = crypto.randomUUID();
     const tx = db
       .insert(transactions)
       .values({
-        id: txId,
+        id: crypto.randomUUID(),
         accountId: account.id,
         type: "debit",
         amount,
@@ -220,31 +216,13 @@ api.post("/accounts/:discord_id/debit", async (c) => {
     return { balance: newBalance, transaction: tx };
   });
 
-  if ("error" in result) {
-    if (result.error === "not_found") {
-      return c.json(
-        { error: { code: "ACCOUNT_NOT_FOUND", message: "Account not found" } },
-        404
-      );
-    }
-    return c.json(
-      {
-        error: {
-          code: "INSUFFICIENT_BALANCE",
-          message: `Insufficient balance (current: ${result.balance}, required: ${result.required})`,
-        },
-      },
-      400
-    );
-  }
-
   return c.json(result);
 });
 
 // Transfer
 const transferSchema = z.object({
   to_discord_id: z.string().min(1),
-  amount: z.number().int().positive(),
+  amount: z.number().int().positive().max(MAX_AMOUNT),
   reason: z.string().optional(),
 });
 
@@ -268,31 +246,45 @@ api.post("/accounts/:discord_id/transfer", async (c) => {
     );
   }
 
+  const fromAccount = db
+    .select()
+    .from(accounts)
+    .where(eq(accounts.discordId, from_discord_id))
+    .get();
+
+  if (!fromAccount) {
+    return c.json(
+      { error: { code: "ACCOUNT_NOT_FOUND", message: "Source account not found" } },
+      404
+    );
+  }
+
+  const toAccount = db
+    .select()
+    .from(accounts)
+    .where(eq(accounts.discordId, to_discord_id))
+    .get();
+
+  if (!toAccount) {
+    return c.json(
+      { error: { code: "ACCOUNT_NOT_FOUND", message: "Destination account not found" } },
+      404
+    );
+  }
+
+  if (fromAccount.balance < amount) {
+    return c.json(
+      {
+        error: {
+          code: "INSUFFICIENT_BALANCE",
+          message: `Insufficient balance (current: ${fromAccount.balance}, required: ${amount})`,
+        },
+      },
+      400
+    );
+  }
+
   const result = withTransaction(() => {
-    const fromAccount = db
-      .select()
-      .from(accounts)
-      .where(eq(accounts.discordId, from_discord_id))
-      .get();
-
-    if (!fromAccount) return { error: "from_not_found" as const };
-
-    const toAccount = db
-      .select()
-      .from(accounts)
-      .where(eq(accounts.discordId, to_discord_id))
-      .get();
-
-    if (!toAccount) return { error: "to_not_found" as const };
-
-    if (fromAccount.balance < amount) {
-      return {
-        error: "insufficient" as const,
-        balance: fromAccount.balance,
-        required: amount,
-      };
-    }
-
     const fromNewBalance = fromAccount.balance - amount;
     const toNewBalance = toAccount.balance + amount;
     const transferReason = reason || `Transfer to ${to_discord_id}`;
@@ -337,30 +329,6 @@ api.post("/accounts/:discord_id/transfer", async (c) => {
       transaction: debitTx,
     };
   });
-
-  if ("error" in result) {
-    if (result.error === "from_not_found") {
-      return c.json(
-        { error: { code: "ACCOUNT_NOT_FOUND", message: "Source account not found" } },
-        404
-      );
-    }
-    if (result.error === "to_not_found") {
-      return c.json(
-        { error: { code: "ACCOUNT_NOT_FOUND", message: "Destination account not found" } },
-        404
-      );
-    }
-    return c.json(
-      {
-        error: {
-          code: "INSUFFICIENT_BALANCE",
-          message: `Insufficient balance (current: ${result.balance}, required: ${result.required})`,
-        },
-      },
-      400
-    );
-  }
 
   return c.json(result);
 });

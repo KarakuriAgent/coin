@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { config } from "../config.js";
-import { db, persistDb } from "../db/index.js";
+import { db, withTransaction } from "../db/index.js";
 import { accounts } from "../db/schema.js";
 import { setSession, clearSession } from "../middleware/session.js";
 
@@ -76,20 +76,22 @@ auth.get("/discord/callback", async (c) => {
     .get();
 
   if (!existing) {
-    db.insert(accounts)
-      .values({
-        id: crypto.randomUUID(),
-        discordId: user.id,
-        username: user.username,
-      })
-      .run();
-    persistDb();
+    withTransaction(() => {
+      db.insert(accounts)
+        .values({
+          id: crypto.randomUUID(),
+          discordId: user.id,
+          username: user.username,
+        })
+        .run();
+    });
   } else if (user.username !== existing.username) {
-    db.update(accounts)
-      .set({ username: user.username })
-      .where(eq(accounts.id, existing.id))
-      .run();
-    persistDb();
+    withTransaction(() => {
+      db.update(accounts)
+        .set({ username: user.username })
+        .where(eq(accounts.id, existing.id))
+        .run();
+    });
   }
 
   setSession(c, { discord_id: user.id, username: user.username });

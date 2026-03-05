@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "crypto";
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { config } from "../config.js";
 
@@ -32,7 +32,7 @@ function verify(signed: string): string | null {
   return data;
 }
 
-export function getSession(c: { req: { raw: Request } } & any): SessionData | null {
+export function getSession(c: Context): SessionData | null {
   const cookie = getCookie(c, COOKIE_NAME);
   if (!cookie) return null;
   const data = verify(cookie);
@@ -44,7 +44,7 @@ export function getSession(c: { req: { raw: Request } } & any): SessionData | nu
   }
 }
 
-export function setSession(c: any, data: SessionData) {
+export function setSession(c: Context, data: SessionData) {
   const payload = JSON.stringify(data);
   const signed = sign(payload);
   setCookie(c, COOKIE_NAME, signed, {
@@ -55,7 +55,7 @@ export function setSession(c: any, data: SessionData) {
   });
 }
 
-export function clearSession(c: any) {
+export function clearSession(c: Context) {
   deleteCookie(c, COOKIE_NAME, { path: "/" });
 }
 

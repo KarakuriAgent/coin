@@ -9,6 +9,21 @@ import dashboard from "./routes/dashboard.js";
 
 const app = new Hono();
 
+// Global error handler
+app.onError((err, c) => {
+  if (err instanceof SyntaxError) {
+    return c.json(
+      { error: { code: "INVALID_JSON", message: "Invalid JSON body" } },
+      400
+    );
+  }
+  console.error(err);
+  return c.json(
+    { error: { code: "INTERNAL_ERROR", message: "Internal server error" } },
+    500
+  );
+});
+
 // Run migrations on startup
 runMigrations();
 
